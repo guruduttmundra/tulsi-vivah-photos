@@ -1,0 +1,8 @@
+streamlit>=1.50.0
+cython
+numpy
+insightface
+onnxruntime
+opencv-python-headless
+pillow
+requests
