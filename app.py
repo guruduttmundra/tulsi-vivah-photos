@@ -1,8 +1,10 @@
 import os
 import time
 import uuid
+import shutil
 import zipfile
 import mimetypes
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import requests
@@ -21,12 +23,13 @@ PHOTO_INDEX_FILE = "event_face_index.npz"
 VIDEO_INDEX_FILE = "video_face_index.npz"
 THUMB_CACHE = "/tmp/thumb_cache"
 ORIG_CACHE = "/tmp/orig_cache"
+WEB_VID_CACHE = "/tmp/web_vid_cache"
 
 PHOTO_MATCH_THRESHOLD = 0.42  # Lower to 0.38 if missing photos; raise to 0.48 if false matches appear
 VIDEO_MATCH_THRESHOLD = 0.40  # Slightly more lenient for moving faces in video
 
-os.makedirs(THUMB_CACHE, exist_ok=True)
-os.makedirs(ORIG_CACHE, exist_ok=True)
+for d in (THUMB_CACHE, ORIG_CACHE, WEB_VID_CACHE):
+    os.makedirs(d, exist_ok=True)
 
 
 @st.cache_resource
@@ -77,6 +80,33 @@ def load_indexes_and_model():
 
 session = load_session()
 photo_index, video_index, app = load_indexes_and_model()
+
+
+def prune_cache(folder, max_mb=400):
+    """Remove oldest cached files if folder exceeds max_mb to protect free Cloud disk."""
+    try:
+        entries = []
+        total = 0
+        for name in os.listdir(folder):
+            p = os.path.join(folder, name)
+            if os.path.isfile(p) and not name.endswith(".part"):
+                st_info = os.stat(p)
+                total += st_info.st_size
+                entries.append((st_info.st_mtime, st_info.st_size, p))
+        limit = max_mb * 1024 * 1024
+        if total <= limit:
+            return
+        entries.sort()
+        for _, sz, p in entries:
+            try:
+                os.remove(p)
+                total -= sz
+            except OSError:
+                pass
+            if total <= limit * 0.75:
+                break
+    except Exception:
+        pass
 
 
 def download_photo_preview(item):
@@ -130,6 +160,7 @@ def download_original(item):
     if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
         return local_path, item["rel_path"]
 
+    prune_cache(ORIG_CACHE, max_mb=400)
     urls = [
         f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t",
         f"https://drive.google.com/uc?export=download&id={fid}",
@@ -164,8 +195,64 @@ def download_original(item):
     return None, item["rel_path"]
 
 
+def get_web_video(item):
+    """Creates a lightweight, fast-start MP4 preview for smooth zero-buffer streaming."""
+    fid = item["id"]
+    web_path = os.path.join(WEB_VID_CACHE, f"{fid}_web.mp4")
+    if os.path.exists(web_path) and os.path.getsize(web_path) > 0:
+        return web_path
+
+    orig_path, _ = download_original(item)
+    if not orig_path or not os.path.exists(orig_path):
+        return None
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return orig_path
+
+    prune_cache(WEB_VID_CACHE, max_mb=250)
+    tmp_out = f"{web_path}.{uuid.uuid4().hex[:6]}.mp4"
+    size_mb = os.path.getsize(orig_path) / (1024 * 1024)
+
+    try:
+        if size_mb <= 5.0:
+            # Already small: just move moov atom to front for instant playback (<0.3s)
+            cmd = [
+                ffmpeg_bin, "-y", "-i", orig_path,
+                "-c", "copy", "-movflags", "+faststart",
+                tmp_out,
+            ]
+        else:
+            # Compress heavy camera clip into smooth 720p fast-start web MP4
+            cmd = [
+                ffmpeg_bin, "-y", "-i", orig_path,
+                "-vf", "scale='min(720,iw)':-2",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-maxrate", "1500k", "-bufsize", "3000k",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "96k",
+                "-movflags", "+faststart",
+                tmp_out,
+            ]
+
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        if res.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+            os.replace(tmp_out, web_path)
+            return web_path
+    except Exception:
+        pass
+    finally:
+        if os.path.exists(tmp_out):
+            try:
+                os.remove(tmp_out)
+            except OSError:
+                pass
+
+    return orig_path
+
+
 def make_direct_downloader(item, fallback_path=None):
-    """Returns a lazy zero-arg callable that fetches full-res bytes only when clicked."""
+    """Lazy callable that fetches full-res bytes only when clicked."""
     def _fetch_bytes():
         local_path, _ = download_original(item)
         target = local_path or fallback_path
@@ -198,6 +285,27 @@ def search_index(index_dict, query_emb, threshold):
     return results
 
 
+@st.dialog("Video Player", width="large")
+def open_video_dialog(item, label, clean_name, mime_type):
+    st.caption(f"{label} — Playing optimized web preview. Use the button below for full original HD.")
+    with st.spinner("Preparing smooth video playback..."):
+        web_path = get_web_video(item)
+    if web_path and os.path.exists(web_path):
+        st.video(web_path, autoplay=True)
+        st.download_button(
+            label="Download Original HD Video",
+            data=make_direct_downloader(item, fallback_path=web_path),
+            file_name=clean_name,
+            mime=mime_type,
+            key=f"modal_dl_{item['id']}",
+            type="primary",
+            on_click="ignore",
+            width="stretch",
+        )
+    else:
+        st.error("Could not load this video right now. Try the Download button on the card instead.")
+
+
 # --- UI ---
 st.title("Find your photos & videos of Tulsi Vivah")
 st.write("Upload a clear selfie or take one with your camera to pull up all your pictures and videos.")
@@ -207,7 +315,6 @@ for key, default in [
     ("photo_pairs", []),
     ("video_pairs", []),
     ("zip_path", None),
-    ("active_video", None),
     ("search_msg", ""),
     ("searched", False),
 ]:
@@ -238,7 +345,6 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                 st.session_state.photo_pairs = []
                 st.session_state.video_pairs = []
                 st.session_state.zip_path = None
-                st.session_state.active_video = None
                 st.session_state.searched = False
                 st.error("No face detected. Try better lighting and face the camera directly.")
             else:
@@ -253,7 +359,6 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                     st.session_state.photo_pairs = []
                     st.session_state.video_pairs = []
                     st.session_state.zip_path = None
-                    st.session_state.active_video = None
                     st.session_state.searched = False
                     st.warning("No matching photos or videos found. Try a clearer selfie without sunglasses or blur.")
                 else:
@@ -268,7 +373,6 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                     st.session_state.photo_pairs = photo_pairs
                     st.session_state.video_pairs = video_pairs
                     st.session_state.zip_path = None
-                    st.session_state.active_video = None
                     st.session_state.searched = True
 
                     elapsed = time.time() - t0
@@ -351,26 +455,7 @@ if st.session_state.searched:
         elif not st.session_state.video_pairs:
             st.info("No matching videos found for this selfie.")
         else:
-            # Built-in video player (streams directly from app server, never exposes Drive)
-            if st.session_state.active_video is not None:
-                active = st.session_state.active_video
-                with st.container(border=True):
-                    pcol1, pcol2 = st.columns([4, 1])
-                    with pcol1:
-                        st.subheader(f"Playing {active['label']}")
-                    with pcol2:
-                        if st.button("Close Player", width="stretch"):
-                            st.session_state.active_video = None
-                            st.rerun()
-
-                    with st.spinner("Loading video..."):
-                        vid_local, _ = download_original(active["item"])
-                    if vid_local and os.path.exists(vid_local):
-                        st.video(vid_local)
-                    else:
-                        st.error("Could not load this video right now. Try the Download button instead.")
-
-            st.caption("Tap **Watch** to play right here, or **Download** to save the video directly to your device.")
+            st.caption("Tap **Watch** to play in a popup right here, or **Download** to save the original HD video.")
             vcols = st.columns(3)
             for idx, (thumb_path, item) in enumerate(st.session_state.video_pairs):
                 ext = os.path.splitext(item["rel_path"])[1] or ".mp4"
@@ -383,8 +468,7 @@ if st.session_state.searched:
                     b1, b2 = st.columns(2)
                     with b1:
                         if st.button("Watch", key=f"watch_{item['id']}", width="stretch"):
-                            st.session_state.active_video = {"item": item, "label": f"Video {idx + 1}"}
-                            st.rerun()
+                            open_video_dialog(item, f"Video {idx + 1}", clean_name, mime_type)
                     with b2:
                         st.download_button(
                             label="Download",
