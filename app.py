@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import zipfile
+import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import requests
@@ -133,22 +134,46 @@ def download_original(item):
         f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t",
         f"https://drive.google.com/uc?export=download&id={fid}",
     ]
+    tmp_path = f"{local_path}.{uuid.uuid4().hex[:6]}.part"
+
     for url in urls:
         for attempt in range(2):
             try:
-                r = session.get(url, timeout=60, allow_redirects=True)
-                ctype = r.headers.get("content-type", "").lower()
-                if r.status_code == 200 and r.content and not ctype.startswith("text/html"):
-                    with open(local_path, "wb") as f:
-                        f.write(r.content)
-                    return local_path, item["rel_path"]
-                if r.status_code in (429, 500, 502, 503, 504):
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                break
+                with session.get(url, timeout=90, allow_redirects=True, stream=True) as r:
+                    ctype = r.headers.get("content-type", "").lower()
+                    if r.status_code == 200 and not ctype.startswith("text/html"):
+                        with open(tmp_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=512 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                        if os.path.getsize(tmp_path) > 0:
+                            os.replace(tmp_path, local_path)
+                            return local_path, item["rel_path"]
+                    if r.status_code in (429, 500, 502, 503, 504):
+                        time.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
             except Exception:
                 time.sleep(1)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
     return None, item["rel_path"]
+
+
+def make_direct_downloader(item, fallback_path=None):
+    """Returns a lazy zero-arg callable that fetches full-res bytes only when clicked."""
+    def _fetch_bytes():
+        local_path, _ = download_original(item)
+        target = local_path or fallback_path
+        if target and os.path.exists(target):
+            with open(target, "rb") as f:
+                return f.read()
+        return b""
+    return _fetch_bytes
 
 
 def search_index(index_dict, query_emb, threshold):
@@ -182,6 +207,7 @@ for key, default in [
     ("photo_pairs", []),
     ("video_pairs", []),
     ("zip_path", None),
+    ("active_video", None),
     ("search_msg", ""),
     ("searched", False),
 ]:
@@ -212,6 +238,7 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                 st.session_state.photo_pairs = []
                 st.session_state.video_pairs = []
                 st.session_state.zip_path = None
+                st.session_state.active_video = None
                 st.session_state.searched = False
                 st.error("No face detected. Try better lighting and face the camera directly.")
             else:
@@ -226,6 +253,7 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                     st.session_state.photo_pairs = []
                     st.session_state.video_pairs = []
                     st.session_state.zip_path = None
+                    st.session_state.active_video = None
                     st.session_state.searched = False
                     st.warning("No matching photos or videos found. Try a clearer selfie without sunglasses or blur.")
                 else:
@@ -240,6 +268,7 @@ if st.button("Find My Photos & Videos", type="primary", width="stretch"):
                     st.session_state.photo_pairs = photo_pairs
                     st.session_state.video_pairs = video_pairs
                     st.session_state.zip_path = None
+                    st.session_state.active_video = None
                     st.session_state.searched = True
 
                     elapsed = time.time() - t0
@@ -261,10 +290,10 @@ if st.session_state.searched:
         else:
             col_zip1, col_zip2 = st.columns([1, 2])
             with col_zip1:
-                if st.button("Prepare Full-Quality Photos ZIP", width="stretch"):
+                if st.button("Prepare All Photos (ZIP)", width="stretch"):
                     items = st.session_state.matched_photos
                     total = len(items)
-                    bar = st.progress(0, text=f"Downloading 0/{total} full-resolution photos...")
+                    bar = st.progress(0, text=f"Preparing 0/{total} full-resolution photos...")
                     downloaded = []
                     with ThreadPoolExecutor(max_workers=10) as pool:
                         futures = [pool.submit(download_original, item) for item in items]
@@ -272,23 +301,19 @@ if st.session_state.searched:
                             local_path, rel_path = fut.result()
                             if local_path:
                                 downloaded.append((local_path, rel_path))
-                            bar.progress(done / total, text=f"Downloading {done}/{total} full-resolution photos...")
+                            bar.progress(done / total, text=f"Preparing {done}/{total} full-resolution photos...")
 
                     if downloaded:
                         zip_path = f"/tmp/tulsi_vivah_photos_{uuid.uuid4().hex[:8]}.zip"
-                        used_names = set()
                         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                             for i, (local_path, rel_path) in enumerate(downloaded, 1):
-                                arcname = rel_path
-                                if arcname in used_names:
-                                    arcname = f"{i:03d}_{os.path.basename(rel_path)}"
-                                used_names.add(arcname)
-                                zf.write(local_path, arcname=arcname)
+                                ext = os.path.splitext(rel_path)[1] or ".jpg"
+                                zf.write(local_path, arcname=f"Tulsi_Vivah_Photo_{i:03d}{ext}")
                         st.session_state.zip_path = zip_path
                         bar.empty()
                     else:
                         bar.empty()
-                        st.error("Could not download original files from Google Drive.")
+                        st.error("Could not prepare the ZIP right now. Please try again.")
 
             with col_zip2:
                 if st.session_state.zip_path and os.path.exists(st.session_state.zip_path):
@@ -296,18 +321,29 @@ if st.session_state.searched:
                         st.download_button(
                             label=f"Download ZIP ({len(st.session_state.matched_photos)} Full-Res Photos)",
                             data=zf,
-                            file_name="tulsi_vivah_my_photos.zip",
+                            file_name="Tulsi_Vivah_My_Photos.zip",
                             mime="application/zip",
                             type="primary",
+                            on_click="ignore",
                         )
 
             st.divider()
             cols = st.columns(4)
             for idx, (preview_path, item) in enumerate(st.session_state.photo_pairs):
+                ext = os.path.splitext(item["rel_path"])[1] or ".jpg"
+                clean_name = f"Tulsi_Vivah_Photo_{idx + 1:02d}{ext}"
+                mime_type = mimetypes.guess_type(clean_name)[0] or "image/jpeg"
                 with cols[idx % 4]:
                     st.image(preview_path, width="stretch")
-                    drive_url = f"https://drive.google.com/file/d/{item['id']}/view"
-                    st.markdown(f"[Open Full Quality]({drive_url})")
+                    st.download_button(
+                        label="Download HD",
+                        data=make_direct_downloader(item, fallback_path=preview_path),
+                        file_name=clean_name,
+                        mime=mime_type,
+                        key=f"dl_photo_{item['id']}",
+                        on_click="ignore",
+                        width="stretch",
+                    )
 
     with videos_tab:
         if video_index is None:
@@ -315,20 +351,50 @@ if st.session_state.searched:
         elif not st.session_state.video_pairs:
             st.info("No matching videos found for this selfie.")
         else:
-            st.caption("Tap **Watch** to stream directly in Google Drive, or **Download** to save the MP4 to your device.")
+            # Built-in video player (streams directly from app server, never exposes Drive)
+            if st.session_state.active_video is not None:
+                active = st.session_state.active_video
+                with st.container(border=True):
+                    pcol1, pcol2 = st.columns([4, 1])
+                    with pcol1:
+                        st.subheader(f"Playing {active['label']}")
+                    with pcol2:
+                        if st.button("Close Player", width="stretch"):
+                            st.session_state.active_video = None
+                            st.rerun()
+
+                    with st.spinner("Loading video..."):
+                        vid_local, _ = download_original(active["item"])
+                    if vid_local and os.path.exists(vid_local):
+                        st.video(vid_local)
+                    else:
+                        st.error("Could not load this video right now. Try the Download button instead.")
+
+            st.caption("Tap **Watch** to play right here, or **Download** to save the video directly to your device.")
             vcols = st.columns(3)
             for idx, (thumb_path, item) in enumerate(st.session_state.video_pairs):
+                ext = os.path.splitext(item["rel_path"])[1] or ".mp4"
+                clean_name = f"Tulsi_Vivah_Video_{idx + 1:02d}{ext}"
+                mime_type = mimetypes.guess_type(clean_name)[0] or "video/mp4"
                 with vcols[idx % 3]:
                     if thumb_path:
                         st.image(thumb_path, width="stretch")
-                    st.caption(os.path.basename(item["rel_path"]))
+                    st.caption(f"Video {idx + 1}")
                     b1, b2 = st.columns(2)
-                    watch_url = f"https://drive.google.com/file/d/{item['id']}/view"
-                    dl_url = f"https://drive.usercontent.google.com/download?id={item['id']}&export=download&confirm=t"
                     with b1:
-                        st.link_button("Watch", watch_url, width="stretch")
+                        if st.button("Watch", key=f"watch_{item['id']}", width="stretch"):
+                            st.session_state.active_video = {"item": item, "label": f"Video {idx + 1}"}
+                            st.rerun()
                     with b2:
-                        st.link_button("Download", dl_url, width="stretch")
+                        st.download_button(
+                            label="Download",
+                            data=make_direct_downloader(item),
+                            file_name=clean_name,
+                            mime=mime_type,
+                            key=f"dl_vid_{item['id']}",
+                            on_click="ignore",
+                            width="stretch",
+                        )
 
 st.markdown(
     "---\n"
